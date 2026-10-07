@@ -3,7 +3,7 @@ import os
 
 import aws_cdk as cdk
 
-from kev_systemone.stacks import EcrStack, SystemOneStack
+from kev_systemone.stacks import SystemOneStack
 
 app = cdk.App()
 env = cdk.Environment(account=os.getenv("CDK_DEFAULT_ACCOUNT"), region=os.getenv("CDK_DEFAULT_REGION"))
@@ -15,7 +15,6 @@ def ctx(key: str, default: str) -> str:
 
 repository_name = ctx("ecrRepository", "kev-model-systemone-serverless")
 
-EcrStack(app, "KevEcrStack", repository_name=repository_name, env=env)
 SystemOneStack(
     app, "KevSystemOneStack",
     repository_name=repository_name,

@@ -1,7 +1,7 @@
 import aws_cdk as cdk
 from aws_cdk.assertions import Match, Template
 
-from kev_systemone.stacks import EcrStack, SystemOneStack
+from kev_systemone.stacks import SystemOneStack
 
 
 def system_one_template() -> Template:
@@ -38,7 +38,3 @@ def test_ingest_state_machine_and_bucket():
         "PublicAccessBlockConfiguration": Match.object_like({"BlockPublicAcls": True, "RestrictPublicBuckets": True}),
     })
 
-
-def test_ecr_repository_is_named():
-    stack = EcrStack(cdk.App(), "Ecr", repository_name="repo")
-    Template.from_stack(stack).has_resource_properties("AWS::ECR::Repository", {"RepositoryName": "repo"})

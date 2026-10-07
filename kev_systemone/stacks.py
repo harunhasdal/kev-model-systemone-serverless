@@ -17,21 +17,6 @@ from constructs import Construct
 MAX_STATE_TOKENS = 8192   # validated context of Kev-0.8B; the Lambda CPU path builds an L x L attention mask
 
 
-class EcrStack(Stack):
-    """The repository the GitHub Actions workflow pushes the inference image to."""
-
-    def __init__(self, scope: Construct, construct_id: str, *, repository_name: str, **kwargs) -> None:
-        super().__init__(scope, construct_id, **kwargs)
-        ecr.Repository(
-            self, "Repository",
-            repository_name=repository_name,
-            image_scan_on_push=True,
-            removal_policy=RemovalPolicy.DESTROY,
-            empty_on_delete=True,
-            lifecycle_rules=[ecr.LifecycleRule(max_image_count=10)],
-        )
-
-
 class SystemOneStack(Stack):
     """Model ingest (Step Functions), CPU inference (Lambda container) and the REST API in front of it."""
 
