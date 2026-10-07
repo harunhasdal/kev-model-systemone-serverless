@@ -1,3 +1,5 @@
+import json
+
 import aws_cdk as cdk
 from aws_cdk.assertions import Match, Template
 
@@ -38,3 +40,10 @@ def test_ingest_state_machine_and_bucket():
         "PublicAccessBlockConfiguration": Match.object_like({"BlockPublicAcls": True, "RestrictPublicBuckets": True}),
     })
 
+
+
+def test_ingest_tasks_pass_the_state_input_as_an_object():
+    # A string Parameters ("$") reached the Lambda as a str event and broke event.get().
+    template = system_one_template()
+    machine = next(iter(template.find_resources("AWS::StepFunctions::StateMachine").values()))
+    assert '"Parameters": "$"' not in json.dumps(machine["Properties"]["DefinitionString"])

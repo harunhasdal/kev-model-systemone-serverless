@@ -50,14 +50,9 @@ class SystemOneStack(Stack):
         bucket.grant_read_write(copy_fn)
         bucket.grant_read_write(list_fn)   # prunes stale keys
 
-        list_task = tasks.LambdaInvoke(
-            self, "ListFiles", lambda_function=list_fn, payload=sfn.TaskInput.from_json_path_at("$"),
-            payload_response_only=True,
-        )
-        copy_task = tasks.LambdaInvoke(
-            self, "CopyFile", lambda_function=copy_fn, payload=sfn.TaskInput.from_json_path_at("$"),
-            payload_response_only=True,
-        )
+        # No payload: the state input is the Lambda event, and the function's return value is the state output.
+        list_task = tasks.LambdaInvoke(self, "ListFiles", lambda_function=list_fn, payload_response_only=True)
+        copy_task = tasks.LambdaInvoke(self, "CopyFile", lambda_function=copy_fn, payload_response_only=True)
         copy_task.add_retry(errors=["States.ALL"], interval=Duration.seconds(10), max_attempts=3, backoff_rate=2)
         copy_all = sfn.Map(self, "CopyFiles", items_path="$.files", max_concurrency=4, result_path=sfn.JsonPath.DISCARD)
         copy_all.item_processor(copy_task)
