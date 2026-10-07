@@ -183,14 +183,6 @@ curl -s --max-time 150 -X POST "$KEV_API_URL/v1/systemone" \
   }'
 ```
 
-**Check the length limit:** a state over 8,192 tokens returns HTTP 422 with the token count.
-
-```
-curl -s -o /dev/null -w '%{http_code}\n' --max-time 150 -X POST "$KEV_API_URL/v1/systemone" \
-  -H "x-api-key: $KEV_API_KEY" -H "content-type: application/json" \
-  -d "{\"state\": \"$(printf 'word %.0s' $(seq 1 9000))\", \"questions\": {\"u\": {\"type\": \"noul\"}}}"
-```
-
 A request without the key returns 403.
 
 ## Limits
