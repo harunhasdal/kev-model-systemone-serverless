@@ -77,6 +77,7 @@ class SystemOneStack(Stack):
             code=_lambda.DockerImageCode.from_ecr(repository, tag_or_digest=image_tag),
             architecture=_lambda.Architecture.X86_64,
             memory_size=10240,   # also sets the vCPU share: 6 vCPUs at 10 GB
+            ephemeral_storage_size=Size.mebibytes(4096),   # the model is staged from the image to /tmp at start-up
             timeout=Duration.minutes(2),
             log_group=logs.LogGroup(self, "InferenceLogs", retention=logs.RetentionDays.ONE_WEEK, removal_policy=RemovalPolicy.DESTROY),
             environment={"MAX_STATE_TOKENS": str(MAX_STATE_TOKENS)},

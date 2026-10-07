@@ -22,6 +22,7 @@ def test_inference_function_is_a_cpu_container():
     system_one_template().has_resource_properties("AWS::Lambda::Function", {
         "PackageType": "Image",
         "MemorySize": 10240,
+        "EphemeralStorage": {"Size": 4096},
         "Architectures": ["x86_64"],
         "Environment": {"Variables": Match.object_like({"MAX_STATE_TOKENS": "8192"})},
     })
