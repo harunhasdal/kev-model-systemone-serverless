@@ -17,6 +17,7 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
   ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'kev-model-systemone-serverless' }}
   STACK: KevSystemOneStack
+  CDK_VERSION: 2.1144.0
 
 jobs:
   test:
@@ -24,14 +25,23 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
       - run: uv sync
       - run: uv run pytest -q
 
+  # The image is tagged with the git tree hash of container/, so it is rebuilt only when that directory changes.
   build-and-push:
     needs: test
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
+
+      - id: tag
+        run: echo "tag=$(git rev-parse HEAD:container)" >> "$GITHUB_OUTPUT"
 
       - uses: aws-actions/configure-aws-credentials@v6
         with:
@@ -47,19 +57,28 @@ jobs:
             || aws ecr create-repository --repository-name "$ECR_REPOSITORY" \
                  --image-scanning-configuration scanOnPush=false
 
-      - uses: docker/setup-buildx-action@v4
+      - id: exists
+        name: Look for an image with this tag
+        run: |
+          if aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="${{ steps.tag.outputs.tag }}" > /dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.exists.outputs.found == 'false'
+        uses: docker/setup-buildx-action@v4
 
       # Lambda rejects OCI image indexes, so provenance and SBOM attestations stay off.
-      - uses: docker/build-push-action@v7
+      - if: steps.exists.outputs.found == 'false'
+        uses: docker/build-push-action@v7
         with:
           context: container
           platforms: linux/amd64
           push: true
           provenance: false
           sbom: false
-          tags: |
-            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
-            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -71,6 +90,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
       - run: uv sync --no-dev
 
       - uses: aws-actions/configure-aws-credentials@v6
@@ -81,15 +103,20 @@ jobs:
       - name: Enable pnpm
         run: corepack enable pnpm
 
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/pnpm
+          key: pnpm-dlx-cdk-${{ env.CDK_VERSION }}
+
       - name: Bootstrap CDK if the account/region is not bootstrapped
         run: |
           aws cloudformation describe-stacks --stack-name CDKToolkit > /dev/null 2>&1 \
-            || pnpm dlx aws-cdk@2 bootstrap
+            || pnpm dlx aws-cdk@${CDK_VERSION} bootstrap
 
       - name: Deploy
         run: |
-          pnpm dlx aws-cdk@2 deploy "$STACK" --require-approval never --outputs-file cdk-outputs.json \
-            -c imageTag="$GITHUB_SHA" -c ecrRepository="$ECR_REPOSITORY"
+          pnpm dlx aws-cdk@${CDK_VERSION} deploy "$STACK" --require-approval never --outputs-file cdk-outputs.json \
+            -c imageTag="${{ needs.build-and-push.outputs.tag }}" -c ecrRepository="$ECR_REPOSITORY"
 
       - name: Copy the model from Hugging Face to S3
         run: |
@@ -106,7 +133,7 @@ jobs:
       - name: Summary
         run: |
           {
-            echo "### Deployed $GITHUB_SHA"
+            echo "### Deployed $GITHUB_SHA (image ${{ needs.build-and-push.outputs.tag }})"
             echo "- API: $(jq -r --arg s "$STACK" '.[$s].ApiUrl' cdk-outputs.json)"
             echo "- API key id: $(jq -r --arg s "$STACK" '.[$s].ApiKeyId' cdk-outputs.json)"
           } >> "$GITHUB_STEP_SUMMARY"

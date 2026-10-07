@@ -28,8 +28,10 @@ Step Functions (ingest)                 API Gateway (REST, API key)
 Everything runs from `.github/workflows/ci.yml` on push to `main` or manual dispatch (no local CDK commands):
 
 1. `test`: `uv run pytest`.
-2. `build-and-push`: creates the ECR repository if missing, builds `container/`, pushes `:<git sha>` and `:latest`.
-3. `deploy`: bootstraps CDK if `CDKToolkit` is absent, deploys `KevSystemOneStack` with `-c imageTag=<git sha>`, then
+2. `build-and-push`: creates the ECR repository if missing, then builds and pushes `container/` as
+   `:<git tree hash of container/>` unless an image with that tag already exists, so commits that don't touch
+   `container/` skip the build. Docker layers are cached in the GitHub Actions cache.
+3. `deploy`: bootstraps CDK if `CDKToolkit` is absent, deploys `KevSystemOneStack` with `-c imageTag=<container tree hash>`, then
    runs the ingest state machine (idempotent: files already in S3 with the right size are skipped, stale keys are pruned)
    and waits for it. The job summary shows the API URL and API key id.
 
