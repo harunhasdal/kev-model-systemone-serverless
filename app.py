@@ -24,6 +24,7 @@ SystemOneStack(
     repository_name=ctx("ecrRepository", "kev-model-systemone-serverless"),
     image_tag=ctx("imageTag", "latest"),
     model_bucket=model.bucket,
+    provisioned_concurrency=int(ctx("provisionedConcurrency", "0")),
     env=env,
 )
 

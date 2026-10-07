@@ -138,9 +138,11 @@ jobs:
       - name: Deploy
         run: |
           pnpm dlx aws-cdk@${CDK_VERSION} deploy KevSystemOneStack --require-approval never --outputs-file cdk-outputs.json \
-            -c imageTag="${{ needs.build-and-push.outputs.tag }}" -c ecrRepository="$ECR_REPOSITORY"
+            -c imageTag="${{ needs.build-and-push.outputs.tag }}" -c ecrRepository="$ECR_REPOSITORY" \
+            -c provisionedConcurrency="${{ vars.PROVISIONED_CONCURRENCY || '0' }}"
 
-      # Invokes the function with an API Gateway event. The first call is a cold start (model download and load).
+      # Calls the deployed API with the API key. Without provisioned concurrency the first call is a cold start of
+      # about 90 s, which response streaming (integration timeout 150 s) allows.
       - name: Smoke test
         run: |
           BUCKET=$(aws cloudformation describe-stacks --stack-name KevModelStack \
@@ -150,17 +152,20 @@ jobs:
             echo "::warning::No model files in s3://$BUCKET/models/; run the 'ingest' workflow. Skipping the smoke test."
             exit 0
           fi
-          FN=$(jq -r '.KevSystemOneStack.InferenceFunctionName' cdk-outputs.json)
-          BODY=$(jq -nc '{state: "I was charged twice for order 1182.", questions: {urgent: {type: "noul", instructions: "Does this need a reply today?"}}}')
-          jq -n --arg body "$BODY" '{resource: "/v1/systemone", path: "/v1/systemone", httpMethod: "POST",
-            headers: {"content-type": "application/json"}, multiValueHeaders: {"content-type": ["application/json"]},
-            isBase64Encoded: false, body: $body,
-            requestContext: {resourcePath: "/v1/systemone", httpMethod: "POST", path: "/demo/v1/systemone", stage: "demo", identity: {sourceIp: "127.0.0.1"}}}' > event.json
-          aws lambda invoke --function-name "$FN" --payload fileb://event.json --cli-binary-format raw-in-base64-out \
-            --cli-read-timeout 300 out.json > invoke.json
-          cat invoke.json
-          jq -e '(.FunctionError | not) and .StatusCode == 200' invoke.json > /dev/null
-          jq -e '.statusCode == 200 and (.body | fromjson | .answers.urgent.type == "noul")' out.json
+          URL=$(jq -r '.KevSystemOneStack.ApiUrl' cdk-outputs.json)v1/systemone
+          KEY=$(aws apigateway get-api-key --api-key "$(jq -r '.KevSystemOneStack.ApiKeyId' cdk-outputs.json)" \
+            --include-value --query value --output text)
+          echo "::add-mask::$KEY"
+          BODY='{"state": "I was charged twice for order 1182.", "questions": {"urgent": {"type": "noul", "instructions": "Does this need a reply today?"}}}'
+          for attempt in 1 2; do
+            CODE=$(curl -sS -o out.json -w '%{http_code}' --max-time 240 -X POST "$URL" \
+              -H "x-api-key: $KEY" -H "content-type: application/json" -d "$BODY" || true)
+            echo "attempt $attempt: HTTP $CODE"
+            [ "$CODE" = 200 ] && break
+            head -c 500 out.json || true; echo
+          done
+          [ "$CODE" = 200 ]
+          jq -e '.answers.urgent.type == "noul"' out.json
 
       - name: Summary
         run: |

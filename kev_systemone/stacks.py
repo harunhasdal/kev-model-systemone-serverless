@@ -71,7 +71,7 @@ class SystemOneStack(Stack):
     """CPU inference (Lambda container that loads the model from S3 at start-up) and the REST API in front of it."""
 
     def __init__(self, scope: Construct, construct_id: str, *, repository_name: str, image_tag: str,
-                 model_bucket: s3.IBucket, **kwargs) -> None:
+                 model_bucket: s3.IBucket, provisioned_concurrency: int = 0, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         repository = ecr.Repository.from_repository_name(self, "Repository", repository_name)
@@ -83,9 +83,23 @@ class SystemOneStack(Stack):
             ephemeral_storage_size=Size.mebibytes(4096),   # the model is downloaded to /tmp at start-up
             timeout=Duration.minutes(2),
             log_group=logs.LogGroup(self, "InferenceLogs", retention=logs.RetentionDays.ONE_WEEK, removal_policy=RemovalPolicy.DESTROY),
-            environment={"MODEL_BUCKET": model_bucket.bucket_name, "MAX_STATE_TOKENS": str(MAX_STATE_TOKENS)},
+            environment={
+                "MODEL_BUCKET": model_bucket.bucket_name,
+                "MAX_STATE_TOKENS": str(MAX_STATE_TOKENS),
+                # Streaming lets API Gateway wait past 29 s (up to the integration timeout) for a cold start.
+                "AWS_LWA_INVOKE_MODE": "response_stream",
+                # Async init returns from the 10 s init phase and loads the model during the first request; with
+                # provisioned concurrency the model must load in the init phase (up to 15 min) so it is ready before use.
+                "AWS_LWA_ASYNC_INIT": "false" if provisioned_concurrency else "true",
+            },
         )
         model_bucket.grant_read(inference)
+
+        # Provisioned concurrency applies to a version or alias, not $LATEST; the API targets the alias.
+        live = _lambda.Alias(
+            self, "LiveAlias", alias_name="live", version=inference.current_version,
+            provisioned_concurrent_executions=provisioned_concurrency or None,
+        )
 
         api = apigw.RestApi(
             self, "Api",
@@ -94,7 +108,9 @@ class SystemOneStack(Stack):
             api_key_source_type=apigw.ApiKeySourceType.HEADER,
             deploy_options=apigw.StageOptions(stage_name="demo", throttling_rate_limit=5, throttling_burst_limit=10),
         )
-        integration = apigw.LambdaIntegration(inference)
+        integration = apigw.LambdaIntegration(
+            live, response_transfer_mode=apigw.ResponseTransferMode.STREAM, timeout=Duration.seconds(150),
+        )
         v1 = api.root.add_resource("v1")
         v1.add_resource("systemone").add_method("POST", integration, api_key_required=True)
         v1.add_resource("models").add_method("GET", integration, api_key_required=True)

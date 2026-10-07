@@ -43,7 +43,9 @@ flowchart LR
     S3 -->|download to /tmp at cold start| FN
 ```
 
-Request path: client, API Gateway (API key), Lambda container. Model path: Hugging Face to S3 (on demand), then S3 to
+Request path: client, API Gateway (API key, response streaming, 150 s integration timeout), the `live` alias of the Lambda
+container. Streaming is used only to get past the 29 s integration limit during a cold start; Kev's answer is one small
+JSON document. Model path: Hugging Face to S3 (on demand), then S3 to
 the Lambda's `/tmp` at each cold start. The Lambda needs read access to the bucket and no internet access at run time.
 Baking the weights into the image was tried and was far slower on Lambda (see Limits).
 
@@ -70,8 +72,9 @@ Everything runs in GitHub Actions; there are no local CDK commands.
    with the git tree hash of `container/`; if an image with that tag exists the build is skipped. Docker layers are
    cached in the GitHub Actions cache.
 4. `deploy-app`: deploys `KevSystemOneStack` with `-c imageTag=<tag>`, then invokes the function once with an API Gateway
-   event (a cold start, up to a few minutes) and fails the job unless it returns 200 with a Noul answer. The smoke test is
-   skipped with a warning if the model bucket is empty. The job summary shows the API URL and API key id.
+   API through API Gateway with the API key (a cold start of about 90 s unless provisioned concurrency is on) and fails the
+   job unless it returns 200 with a Noul answer. The smoke test is skipped with a warning if the model bucket is empty.
+   The job summary shows the API URL and API key id.
 
 `ingest.yml` is run by hand, once at the start and whenever the model should change. It runs the state machine (files
 already in S3 with the right size are skipped, stale keys are pruned) and waits for it. Inputs override the adapter and
@@ -81,14 +84,14 @@ the previous model until they are recycled.
 First run: push (or run `ci`), which deploys everything but warns that the bucket is empty and skips the smoke test; the
 API fails until the model is there. Run `ingest`, then `ci` again to check the deployment end to end.
 
-Repository variables: `AWS_ROLE_ARN` (assumed through OIDC), and optionally `AWS_REGION` (default `us-east-1`) and
-`ECR_REPOSITORY` (default `kev-model-systemone-serverless`). The role needs ECR push and create-repository, CDK
+Repository variables: `AWS_ROLE_ARN` (assumed through OIDC), and optionally `AWS_REGION` (default `us-east-1`),
+`ECR_REPOSITORY` (default `kev-model-systemone-serverless`) and `PROVISIONED_CONCURRENCY` (default `0`, see Limits). The role needs ECR push and create-repository, CDK
 bootstrap and deploy (CloudFormation, IAM, Lambda, API Gateway, S3, Step Functions, logs), `s3:ListBucket` on the model
-bucket, `cloudformation:DescribeStacks`, `lambda:InvokeFunction` (smoke test), and `states:StartExecution` and
+bucket, `cloudformation:DescribeStacks`, `apigateway:GET` on the API key (smoke test), and `states:StartExecution` and
 `states:DescribeExecution`.
 
 CDK context values (`-c`): `ecrRepository`, `imageTag` (default `latest`), `adapterRepo` (`jaredpalmer/kev-0.8b`),
-`baseRepo` (`Qwen/Qwen3.5-0.8B-Base`).
+`baseRepo` (`Qwen/Qwen3.5-0.8B-Base`), `provisionedConcurrency` (default `0`).
 
 ## Use
 
@@ -102,9 +105,15 @@ KEV_API_URL=<ApiUrl without trailing slash> KEV_API_KEY=<key> uv run python samp
 - State is capped at 8,192 tokens (`MAX_STATE_TOKENS`), the length the model card validates. Longer states return 422.
   The CPU path uses eager attention with an L x L mask, so longer states would not fit in 10 GB.
 - Cold start, measured on Lambda (10 GB, 6 vCPUs): 10 s init, 24 s S3 download of about 1.8 GB to `/tmp`, 45 s to load
-  and merge the model on CPU, then the first request: about 83 s billed in total. API Gateway cuts off at 29 s, so the
-  first request after idle returns 504; retry after a minute or two. Provisioned concurrency avoids it at a standing
-  cost. Warm requests take about 0.5 s of model time for two questions.
+  and merge the model on CPU, then the first request: about 83 s billed in total. This happens inside the first request
+  because Lambda Web Adapter's async init (on by default here) returns from the 10 s init phase early. API Gateway's 29 s
+  limit is avoided with response streaming (integration timeout 150 s, Lambda timeout 120 s), so the first request
+  succeeds after about 90 s instead of returning 504. Warm requests take about 0.5 s of model time for two questions.
+- Provisioned concurrency (`PROVISIONED_CONCURRENCY` repository variable, or `-c provisionedConcurrency=1`) keeps one
+  environment ready, so the first request is warm. It only helps if the model loads during init, so it turns async init
+  off (init may then take up to 15 minutes on provisioned environments). It is billed continuously: 10 GB x
+  $0.0000041667 per GB-second (us-east-1, x86, Pricing API 2026-10-07) is about $0.15 an hour or $108 a month,
+  plus duration while requests run. Requests beyond the provisioned environment still cold start.
 - Baking the weights into the image was tried and abandoned: on Lambda, fresh environments did not finish loading
   within the 120 s function timeout (the staging copy from the image to `/tmp` never completed), against about 24 s for
   the S3 download. The cause is not proven; Lambda loads image contents lazily, which fits the symptom.
