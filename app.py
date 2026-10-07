@@ -3,26 +3,26 @@ import os
 
 import aws_cdk as cdk
 
-from demo_kev27b_bedrock_import.demo_kev27b_bedrock_import_stack import DemoKev27BBedrockImportStack
-
+from kev_systemone.stacks import EcrStack, SystemOneStack
 
 app = cdk.App()
-DemoKev27BBedrockImportStack(app, "DemoKev27BBedrockImportStack",
-    # If you don't specify 'env', this stack will be environment-agnostic.
-    # Account/Region-dependent features and context lookups will not work,
-    # but a single synthesized template can be deployed anywhere.
+env = cdk.Environment(account=os.getenv("CDK_DEFAULT_ACCOUNT"), region=os.getenv("CDK_DEFAULT_REGION"))
 
-    # Uncomment the next line to specialize this stack for the AWS Account
-    # and Region that are implied by the current CLI configuration.
 
-    #env=cdk.Environment(account=os.getenv('CDK_DEFAULT_ACCOUNT'), region=os.getenv('CDK_DEFAULT_REGION')),
+def ctx(key: str, default: str) -> str:
+    return app.node.try_get_context(key) or default
 
-    # Uncomment the next line if you know exactly what Account and Region you
-    # want to deploy the stack to. */
 
-    #env=cdk.Environment(account='123456789012', region='us-east-1'),
+repository_name = ctx("ecrRepository", "kev-model-systemone-serverless")
 
-    # For more information, see https://docs.aws.amazon.com/cdk/latest/guide/environments.html
-    )
+EcrStack(app, "KevEcrStack", repository_name=repository_name, env=env)
+SystemOneStack(
+    app, "KevSystemOneStack",
+    repository_name=repository_name,
+    image_tag=ctx("imageTag", "latest"),
+    adapter_repo=ctx("adapterRepo", "jaredpalmer/kev-0.8b"),
+    base_repo=ctx("baseRepo", "Qwen/Qwen3.5-0.8B-Base"),
+    env=env,
+)
 
 app.synth()
