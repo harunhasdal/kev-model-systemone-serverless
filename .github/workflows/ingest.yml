@@ -1,0 +1,65 @@
+name: ingest
+
+# On demand: copy the Kev adapter and its base model from Hugging Face to S3, then rebuild the image from them.
+on:
+  workflow_dispatch:
+    inputs:
+      adapterRepo:
+        description: Adapter repo on Hugging Face (empty = stack default)
+        required: false
+      adapterRevision:
+        description: Adapter revision (empty = main)
+        required: false
+      baseRepo:
+        description: Base model repo on Hugging Face (empty = stack default)
+        required: false
+      baseRevision:
+        description: Base model revision (empty = main)
+        required: false
+      rebuild:
+        description: Run the ci workflow afterwards to rebuild and deploy the image
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write
+  contents: read
+  actions: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    env:
+      ADAPTER_REPO: ${{ inputs.adapterRepo }}
+      ADAPTER_REVISION: ${{ inputs.adapterRevision }}
+      BASE_REPO: ${{ inputs.baseRepo }}
+      BASE_REVISION: ${{ inputs.baseRevision }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run the ingest state machine
+        run: |
+          ARN=$(aws cloudformation describe-stacks --stack-name KevModelStack \
+            --query "Stacks[0].Outputs[?OutputKey=='IngestStateMachineArn'].OutputValue" --output text)
+          INPUT=$(jq -n --arg ar "$ADAPTER_REPO" --arg av "$ADAPTER_REVISION" --arg br "$BASE_REPO" --arg bv "$BASE_REVISION" \
+            '{adapterRepo: $ar, adapterRevision: $av, baseRepo: $br, baseRevision: $bv} | with_entries(select(.value != ""))')
+          EXEC=$(aws stepfunctions start-execution --state-machine-arn "$ARN" --input "$INPUT" --query executionArn --output text)
+          for _ in $(seq 1 120); do
+            STATUS=$(aws stepfunctions describe-execution --execution-arn "$EXEC" --query status --output text)
+            [ "$STATUS" != RUNNING ] && break
+            sleep 15
+          done
+          echo "ingest execution: $STATUS"
+          [ "$STATUS" = SUCCEEDED ]
+
+      - name: Rebuild and deploy
+        if: inputs.rebuild
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"

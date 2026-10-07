@@ -17,14 +17,10 @@ from constructs import Construct
 MAX_STATE_TOKENS = 8192   # validated context of Kev-0.8B; the Lambda CPU path builds an L x L attention mask
 
 
-class SystemOneStack(Stack):
-    """Model ingest (Step Functions), CPU inference (Lambda container) and the REST API in front of it."""
+class ModelStack(Stack):
+    """Model storage and the on-demand Hugging Face to S3 copy (Step Functions). The inference image is built from this bucket."""
 
-    def _logs(self, construct_id: str) -> logs.LogGroup:
-        return logs.LogGroup(self, construct_id, retention=logs.RetentionDays.ONE_WEEK, removal_policy=RemovalPolicy.DESTROY)
-
-    def __init__(self, scope: Construct, construct_id: str, *, repository_name: str, image_tag: str,
-                 adapter_repo: str, base_repo: str, **kwargs) -> None:
+    def __init__(self, scope: Construct, construct_id: str, *, adapter_repo: str, base_repo: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         bucket = s3.Bucket(
@@ -36,7 +32,6 @@ class SystemOneStack(Stack):
             auto_delete_objects=True,
         )
 
-        # --- ingest: Hugging Face -> S3 ---
         ingest_env = {"BUCKET": bucket.bucket_name, "ADAPTER_REPO": adapter_repo, "BASE_REPO": base_repo}
         ingest_code = _lambda.Code.from_asset("lambdas/ingest")
         list_fn = _lambda.Function(
@@ -63,24 +58,30 @@ class SystemOneStack(Stack):
             timeout=Duration.hours(1),
         )
 
-        # --- inference: Kev on CPU in a Lambda container (Lambda Web Adapter in front of kev.serve) ---
+        CfnOutput(self, "ModelBucketName", value=bucket.bucket_name)
+        CfnOutput(self, "IngestStateMachineArn", value=ingest.state_machine_arn)
+
+    def _logs(self, construct_id: str) -> logs.LogGroup:
+        return logs.LogGroup(self, construct_id, retention=logs.RetentionDays.ONE_WEEK, removal_policy=RemovalPolicy.DESTROY)
+
+
+class SystemOneStack(Stack):
+    """CPU inference (Lambda container with the model baked in) and the REST API in front of it."""
+
+    def __init__(self, scope: Construct, construct_id: str, *, repository_name: str, image_tag: str, **kwargs) -> None:
+        super().__init__(scope, construct_id, **kwargs)
+
         repository = ecr.Repository.from_repository_name(self, "Repository", repository_name)
         inference = _lambda.DockerImageFunction(
             self, "InferenceFn",
             code=_lambda.DockerImageCode.from_ecr(repository, tag_or_digest=image_tag),
             architecture=_lambda.Architecture.X86_64,
             memory_size=10240,   # also sets the vCPU share: 6 vCPUs at 10 GB
-            ephemeral_storage_size=Size.mebibytes(4096),
             timeout=Duration.minutes(2),
-            log_group=self._logs("InferenceLogs"),
-            environment={
-                "MODEL_BUCKET": bucket.bucket_name,
-                "MAX_STATE_TOKENS": str(MAX_STATE_TOKENS),
-            },
+            log_group=logs.LogGroup(self, "InferenceLogs", retention=logs.RetentionDays.ONE_WEEK, removal_policy=RemovalPolicy.DESTROY),
+            environment={"MAX_STATE_TOKENS": str(MAX_STATE_TOKENS)},
         )
-        bucket.grant_read(inference)
 
-        # --- REST API ---
         api = apigw.RestApi(
             self, "Api",
             rest_api_name="kev-systemone",
@@ -102,7 +103,5 @@ class SystemOneStack(Stack):
         plan.add_api_key(api_key)
         plan.add_api_stage(stage=api.deployment_stage)
 
-        CfnOutput(self, "ModelBucketName", value=bucket.bucket_name)
-        CfnOutput(self, "IngestStateMachineArn", value=ingest.state_machine_arn)
         CfnOutput(self, "ApiUrl", value=api.url)
         CfnOutput(self, "ApiKeyId", value=api_key.key_id)

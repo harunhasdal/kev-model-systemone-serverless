@@ -1,49 +1,91 @@
 # Kev System One on AWS, serverless
 
 Serves [Kev-0.8B](https://github.com/jaredpalmer/kev/blob/main/docs/model-cards/kev-0.8b.md) (a decision model with
-Choice, Score and Noul questions, TypeSafe `POST /v1/systemone` API) from a CPU Lambda container behind API Gateway.
-It scores options in one forward pass and does not generate text, so it does not stream and is not a Bedrock Custom
-Model Import candidate (Qwen3.5 architecture, adapter-only repo, no LM head).
+Choice, Score and Noul questions, TypeSafe `POST /v1/systemone` API) from a CPU Lambda container behind API Gateway,
+with the model weights baked into the image.
 
+Kev scores options in one forward pass and does not generate text, so the API does not stream and the model is not a
+Bedrock Custom Model Import candidate (Qwen3.5 architecture, adapter-only repo, no LM head).
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph GH[GitHub Actions]
+        CI[ci workflow]
+        ING[ingest workflow, on demand]
+    end
+
+    subgraph ModelStack[KevModelStack]
+        SFN[Step Functions: ListFiles, Map CopyFile]
+        S3[(S3 model bucket)]
+        SFN --> S3
+    end
+
+    HF[Hugging Face: adapter and base model]
+    ECR[(ECR image: code + weights)]
+
+    subgraph AppStack[KevSystemOneStack]
+        APIGW[API Gateway REST, API key and usage plan]
+        FN["Lambda container, 10 GB, CPU: Lambda Web Adapter + kev.serve"]
+        APIGW --> FN
+    end
+
+    CLIENT[Client] -->|POST /v1/systemone| APIGW
+
+    ING -->|start execution| SFN
+    HF -->|streamed, multipart| SFN
+    ING -.->|then dispatches| CI
+    CI -->|cdk deploy| ModelStack
+    CI -->|s3 sync into build context| S3
+    CI -->|docker build and push| ECR
+    CI -->|cdk deploy, imageTag| AppStack
+    ECR -->|image| FN
 ```
-Step Functions (ingest)                 API Gateway (REST, API key)
-  ListFiles -> Map(CopyFile)                      |
-  Hugging Face -> S3                              v
-        |                       Lambda container: Lambda Web Adapter + kev.serve (CPU, fp32)
-        +--------- S3 <-- model download to /tmp at cold start
-```
+
+Request path: client, API Gateway (API key), Lambda container. Build path: Hugging Face to S3 (on demand), S3 into the
+Docker build context, image in ECR, Lambda. The Lambda has no S3 access and does not reach the internet at run time.
 
 ## Layout
 
 | Path | Purpose |
 |---|---|
-| `kev_systemone/stacks.py` | CDK: `KevSystemOneStack` (bucket, ingest, Lambda, API) |
+| `kev_systemone/stacks.py` | CDK: `ModelStack` (bucket, ingest state machine), `SystemOneStack` (Lambda, API) |
 | `lambdas/ingest/` | Hugging Face to S3 copy functions |
-| `container/` | Inference image: CPU torch, `kev` pinned to a commit, `server.py` entry point |
-| `.github/workflows/ci.yml` | Tests, builds and pushes the image, deploys the stack, runs the model ingest |
+| `container/` | Inference image: CPU torch, `kev` pinned to a commit, `server.py` entry point, baked `model/` |
+| `.github/workflows/ci.yml` | Tests, deploys the model stack, builds and pushes the image, deploys the app stack |
+| `.github/workflows/ingest.yml` | On demand: copies the model from Hugging Face to S3, then triggers `ci` |
 | `samples/choice_noul.py` | Choice, Noul and Score demo against the API |
 
 ## CI/CD
 
-Everything runs from `.github/workflows/ci.yml` on push to `main` or manual dispatch (no local CDK commands):
+Everything runs in GitHub Actions; there are no local CDK commands.
+
+`ci.yml` runs on push to `main` or manual dispatch:
 
 1. `test`: `uv run pytest`.
-2. `build-and-push`: creates the ECR repository if missing, then builds and pushes `container/` as
-   `:<git tree hash of container/>` unless an image with that tag already exists, so commits that don't touch
-   `container/` skip the build. Docker layers are cached in the GitHub Actions cache.
-3. `deploy`: bootstraps CDK if `CDKToolkit` is absent, deploys `KevSystemOneStack` with `-c imageTag=<container tree hash>`, then
-   runs the ingest state machine (idempotent: files already in S3 with the right size are skipped, stale keys are pruned)
-   and waits for it. The job summary shows the API URL and API key id.
+2. `deploy-model`: bootstraps CDK if `CDKToolkit` is absent, deploys `KevModelStack`.
+3. `build-and-push`: creates the ECR repository if missing, downloads `s3://<bucket>/models/` into `container/model/`
+   and builds the image. The tag is `<git tree hash of container/>-<fingerprint of the S3 model files>`; if an image
+   with that tag exists the build is skipped. If the bucket is empty the job warns and the rest is skipped.
+4. `deploy-app`: deploys `KevSystemOneStack` with `-c imageTag=<tag>`. The job summary shows the API URL and API key id.
+
+`ingest.yml` is run by hand when the model should change (and once at the start). It runs the state machine (files
+already in S3 with the right size are skipped, stale keys are pruned), waits for it, then dispatches `ci` unless
+`rebuild` is unticked. Inputs override the adapter and base repos and revisions; revisions default to `main` and are
+resolved to commit shas.
+
+First run: push (or run `ci`), which deploys the model stack and stops at the empty bucket with a warning. Run
+`ingest`; it triggers `ci` again, which builds the image and deploys the API.
 
 Repository variables: `AWS_ROLE_ARN` (assumed through OIDC), and optionally `AWS_REGION` (default `us-east-1`) and
 `ECR_REPOSITORY` (default `kev-model-systemone-serverless`). The role needs ECR push and create-repository, CDK
-bootstrap and deploy (CloudFormation, IAM, Lambda, API Gateway, S3, Step Functions, logs) and `states:StartExecution`
-and `states:DescribeExecution` permissions.
+bootstrap and deploy (CloudFormation, IAM, Lambda, API Gateway, S3, Step Functions, logs), `s3:ListBucket` and
+`s3:GetObject` on the model bucket, `cloudformation:DescribeStacks`, and `states:StartExecution` and
+`states:DescribeExecution`.
 
 CDK context values (`-c`): `ecrRepository`, `imageTag` (default `latest`), `adapterRepo` (`jaredpalmer/kev-0.8b`),
-`baseRepo` (`Qwen/Qwen3.5-0.8B-Base`). The ingest input can override `adapterRepo`, `adapterRevision`, `baseRepo` and
-`baseRevision`; revisions default to `main` and are resolved to commit shas. Lambda reads the model at cold start, so
-old environments keep the previous model until they recycle.
+`baseRepo` (`Qwen/Qwen3.5-0.8B-Base`).
 
 ## Use
 
@@ -56,22 +98,72 @@ KEV_API_URL=<ApiUrl without trailing slash> KEV_API_KEY=<key> uv run python samp
 
 - State is capped at 8,192 tokens (`MAX_STATE_TOKENS`), the length the model card validates. Longer states return 422.
   The CPU path uses eager attention with an L x L mask, so longer states would not fit in 10 GB.
-- Cold start downloads about 1.8 GB from S3 and loads the model. This can exceed API Gateway's 29 s integration limit,
-  so the first request after idle may return 504; retry. Provisioned concurrency avoids it at a standing cost.
-- Latency on Lambda CPU has not been measured. On a local Docker Desktop container a three-question request took
-  about 350 to 550 ms.
+- Cold start: with the weights downloaded from S3 at start-up, the first invocation took about 160 s and warm calls
+  about 0.5 s of model time. With the weights in the image the cold start has not been measured yet. API Gateway
+  cuts off at 29 s, so the first request after idle may return 504; retry. Provisioned concurrency avoids it at a
+  standing cost.
 - The API key and usage plan (5 req/s, 1,000 req/day) are the only access control.
+- The base image (`python:3.12-slim`) is not pinned by digest; it refreshes only when `container/` changes.
 
 ## Local test
 
+Put the model under `container/model/{adapter,base}` (the files the ingest copies: `*.json`, `*.safetensors`,
+`*.pt`, `*.txt`, `*.jinja`), then:
+
 ```
 docker build -t kev-systemone container
-docker run -p 8080:8080 -e MODEL_DIR=/models -v "$PWD/.models:/models" kev-systemone   # .models/{adapter,base}
+docker run -p 8080:8080 kev-systemone
 python samples/choice_noul.py
 ```
 
-## Tests
+Or skip the copy into the image and mount a directory: `-e MODEL_DIR=/models -v "$PWD/.models:/models"`.
 
 ```
 uv run pytest
 ```
+
+## Running on SageMaker inference with GPU (guidance, not implemented here)
+
+Use this when the CPU Lambda is too slow, the state length must exceed 8k tokens, or a larger Kev (4B, 9B, 27B) is
+needed. `kev.serve` supports CUDA directly; no model code changes are needed. Figures below are from the Kev model
+cards and the AWS Pricing API (us-east-1, on demand, 2026-10-07); nothing here has been built or tested in this repo.
+
+**Sizing**
+
+| Model | GPU memory resident (model card) | Instance type to start with |
+|---|---|---|
+| Kev-0.8B | 3.8 GB | `ml.g6.xlarge` (1 x L4, 24 GB), about $1.13/h |
+| Kev-4B | 14.3 GB | `ml.g6.xlarge` (L4, 24 GB), about $1.13/h; `ml.g6e.xlarge` (L40S, 48 GB) about $2.61/h for more headroom |
+| Kev-27B | 65.5 GB, peak 87.1 GB at a 64k state | a single 80 GB+ GPU (H100, H200 or B200) and more for the longest states; check which SageMaker instance types offer one in your region |
+
+Check Service Quotas first: the default quota for endpoint usage of GPU instance types is often 0, and an increase can
+take time.
+
+**Container**
+
+1. Base the image on a CUDA PyTorch image (not the CPU wheels). Install `kev` as in `container/Dockerfile`, plus the
+   `flash-linear-attention` version pinned in `kev/fused_qwen35.py` if you want the fused kernels (`kev.serve` uses
+   them when present). `kev.serve` defaults to bf16 and CUDA graphs on CUDA.
+2. SageMaker expects the container to serve on port 8080 with `GET /ping` and `POST /invocations`. `kev.serve` serves
+   `/v1/systemone` and `/v1/models`, so add a thin wrapper that mounts `kev.serve.app` and adds `/ping` (200 once the
+   model is loaded) and `/invocations` (forwards the System One JSON body to the same handler). Drop the Lambda Web
+   Adapter.
+3. Load weights from `/opt/ml/model`. The ingest already leaves `models/adapter/` and `models/base/` in S3; point the
+   model data source at that prefix (uncompressed S3 data source) or package it as `model.tar.gz`. Keep the `head.pt`
+   patch from `container/server.py`, which points the adapter at the local base copy.
+
+**Hosting options**
+
+| Option | Behaviour | Cost shape |
+|---|---|---|
+| Real-time endpoint | Synchronous, `InvokeEndpoint`, lowest latency, no scale to zero | Instance price around the clock, about $822 a month for `ml.g6.xlarge` |
+| Asynchronous endpoint | `InvokeEndpointAsync`: request body in S3, result written to S3 and optionally announced on SNS; can scale to zero instances with Application Auto Scaling | Billed only while an instance is up; the first request after idle waits for instance start, image pull and model load (minutes) |
+
+For a demo, asynchronous with scale to zero is the cheapest. System One returns one small JSON result per request, so
+the asynchronous pattern costs nothing in function. Put API Gateway and a small Lambda in front: the Lambda writes the
+request to S3, calls `InvokeEndpointAsync`, and either polls the output location or returns a job id for the client to
+poll. For a synchronous experience, use a real-time endpoint and call `InvokeEndpoint` from the Lambda.
+
+**CI/CD**: reuse the pattern here. Build the image in GitHub Actions and push it to ECR, tagged by content, and deploy
+the SageMaker model, endpoint config and endpoint (and the scaling policy) with CDK. Do not bake the weights into a
+GPU image unless the endpoint start time matters more than image size; the S3 model data source keeps the image small.

@@ -29,4 +29,9 @@ ARG KEV_REF=5e42a7a03f28134853dd3ff77461457e921e5ec1
 RUN pip install --no-deps "https://github.com/jaredpalmer/kev/archive/${KEV_REF}.tar.gz"
 
 COPY server.py .
+
+# CI downloads the model from S3 into model/{adapter,base} before building. Last, so code changes keep this layer cached.
+COPY model/ /opt/model/
+ENV MODEL_DIR=/opt/model
+
 CMD ["python", "server.py"]
