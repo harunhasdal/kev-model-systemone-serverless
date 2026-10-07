@@ -104,13 +104,15 @@ KEV_API_URL=<ApiUrl without trailing slash> KEV_API_KEY=<key> uv run python samp
 
 - State is capped at 8,192 tokens (`MAX_STATE_TOKENS`), the length the model card validates. Longer states return 422.
   The CPU path uses eager attention with an L x L mask, so longer states would not fit in 10 GB.
-- Cold start, measured on Lambda (10 GB, 6 vCPUs): 10 s init, 24 s S3 download of about 1.8 GB to `/tmp`, 45 s to load
-  and merge the model on CPU, then the first request: about 83 s billed in total. This happens inside the first request
-  because Lambda Web Adapter's async init (on by default here) returns from the 10 s init phase early. API Gateway's 29 s
-  limit is avoided with response streaming (integration timeout 150 s, Lambda timeout 120 s), so the first request
-  succeeds after about 90 s instead of returning 504. Warm requests take about 0.5 s of model time for two questions.
+- Cold start, measured on Lambda (10 GB, 6 vCPUs): 10 s init, then in the first request a 22 to 24 s S3 download of
+  about 1.8 GB to `/tmp` and a model load and merge that took 8 s in the latest measurements and 45 s in an earlier
+  one (about 33 s and 83 s billed in total). Through API Gateway the latest cold request took 38 s end to end and
+  returned 200. The model load happens inside the first request because Lambda Web Adapter's async init (on by default
+  here) returns from the 10 s init phase early. API Gateway's 29 s limit is avoided with response streaming
+  (integration timeout 150 s, Lambda timeout 120 s). Warm requests take about 0.5 to 0.7 s for two questions.
 - Provisioned concurrency (`PROVISIONED_CONCURRENCY` repository variable, or `-c provisionedConcurrency=1`) keeps one
-  environment ready, so the first request is warm. It only helps if the model loads during init, so it turns async init
+  environment ready, so the first request is warm (measured: init about 35 s, then about 0.7 s per request; the first
+  deploy with it on waited about 8 minutes for CloudFormation). It only helps if the model loads during init, so it turns async init
   off (init may then take up to 15 minutes on provisioned environments). It is billed continuously: 10 GB x
   $0.0000041667 per GB-second (us-east-1, x86, Pricing API 2026-10-07) is about $0.15 an hour or $108 a month,
   plus duration while requests run. Requests beyond the provisioned environment still cold start.
