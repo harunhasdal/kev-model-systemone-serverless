@@ -20,37 +20,28 @@ Step Functions (ingest)                 API Gateway (REST, API key)
 | `kev_systemone/stacks.py` | CDK: `KevSystemOneStack` (bucket, ingest, Lambda, API) |
 | `lambdas/ingest/` | Hugging Face to S3 copy functions |
 | `container/` | Inference image: CPU torch, `kev` pinned to a commit, `server.py` entry point |
-| `.github/workflows/container.yml` | Builds the image and pushes it to ECR |
+| `.github/workflows/ci.yml` | Tests, builds and pushes the image, deploys the stack, runs the model ingest |
 | `samples/choice_noul.py` | Choice, Noul and Score demo against the API |
 
-## GitHub Actions
+## CI/CD
+
+Everything runs from `.github/workflows/ci.yml` on push to `main` or manual dispatch (no local CDK commands):
+
+1. `test`: `uv run pytest`.
+2. `build-and-push`: creates the ECR repository if missing, builds `container/`, pushes `:<git sha>` and `:latest`.
+3. `deploy`: bootstraps CDK if `CDKToolkit` is absent, deploys `KevSystemOneStack` with `-c imageTag=<git sha>`, then
+   runs the ingest state machine (idempotent: files already in S3 with the right size are skipped, stale keys are pruned)
+   and waits for it. The job summary shows the API URL and API key id.
 
 Repository variables: `AWS_ROLE_ARN` (assumed through OIDC), and optionally `AWS_REGION` (default `us-east-1`) and
-`ECR_REPOSITORY` (default `kev-model-systemone-serverless`). The workflow creates the repository if it is missing
-(the role needs `ecr:DescribeRepositories` and `ecr:CreateRepository`) and pushes `:<git sha>` and `:latest`.
+`ECR_REPOSITORY` (default `kev-model-systemone-serverless`). The role needs ECR push and create-repository, CDK
+bootstrap and deploy (CloudFormation, IAM, Lambda, API Gateway, S3, Step Functions, logs) and `states:StartExecution`
+and `states:DescribeExecution` permissions.
 
-## Deploy
-
-Requires `uv`, Node (CDK CLI) and an AWS profile. The image must exist before the Lambda stack is deployed.
-
-```
-uv sync
-# push to main (or run the workflow manually) to create the ECR repository and push the image
-uv run cdk deploy KevSystemOneStack -c imageTag=<git sha>
-```
-
-Context values: `ecrRepository`, `imageTag` (default `latest`), `adapterRepo` (`jaredpalmer/kev-0.8b`), `baseRepo`
-(`Qwen/Qwen3.5-0.8B-Base`).
-
-Copy the model to S3 (idempotent; prunes stale keys under `models/adapter/` and `models/base/`):
-
-```
-aws stepfunctions start-execution --state-machine-arn <IngestStateMachineArn> --input '{}'
-```
-
-The input can override `adapterRepo`, `adapterRevision`, `baseRepo` and `baseRevision`; revisions default to `main` and
-are resolved to commit shas. Lambda reads the model at cold start, so redeploy or wait for old environments to recycle
-after re-ingesting.
+CDK context values (`-c`): `ecrRepository`, `imageTag` (default `latest`), `adapterRepo` (`jaredpalmer/kev-0.8b`),
+`baseRepo` (`Qwen/Qwen3.5-0.8B-Base`). The ingest input can override `adapterRepo`, `adapterRevision`, `baseRepo` and
+`baseRevision`; revisions default to `main` and are resolved to commit shas. Lambda reads the model at cold start, so
+old environments keep the previous model until they recycle.
 
 ## Use
 
