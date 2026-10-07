@@ -31,7 +31,7 @@ jobs:
       - run: uv sync
       - run: uv run pytest -q
 
-  # Bucket and ingest state machine. The image is built from this bucket, so it is deployed first.
+  # Bucket and ingest state machine.
   deploy-model:
     needs: test
     runs-on: ubuntu-latest
@@ -61,51 +61,34 @@ jobs:
 
       - run: pnpm dlx aws-cdk@${CDK_VERSION} deploy KevModelStack --require-approval never
 
-  # The image is tagged <git tree hash of container/>-<fingerprint of the S3 model files>, so it is rebuilt only when
-  # either changes. An empty bucket (model not ingested yet) leaves the tag empty and skips the build and the app deploy.
+  # The image is tagged with the git tree hash of container/, so it is rebuilt only when that directory changes.
+  # The model is not in the image: the Lambda downloads it from S3 at start-up.
   build-and-push:
-    needs: deploy-model
+    needs: test
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
 
+      - id: tag
+        run: echo "tag=$(git rev-parse HEAD:container)" >> "$GITHUB_OUTPUT"
+
       - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - id: tag
-        name: Compute the image tag from container/ and the model files in S3
-        run: |
-          BUCKET=$(aws cloudformation describe-stacks --stack-name KevModelStack \
-            --query "Stacks[0].Outputs[?OutputKey=='ModelBucketName'].OutputValue" --output text)
-          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
-          COUNT=$(aws s3 ls "s3://$BUCKET/models/" --recursive | wc -l || true)
-          if [ "${COUNT// /}" = "0" ]; then
-            echo "::warning::No model files in s3://$BUCKET/models/. Run the 'ingest' workflow, then this one."
-            echo "tag=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          TREE=$(git rev-parse HEAD:container)
-          MODEL=$(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix models/ \
-            --query 'Contents[].[Key,Size,ETag]' --output text | sort | sha256sum | cut -c1-12)
-          echo "tag=${TREE:0:12}-${MODEL}" >> "$GITHUB_OUTPUT"
-
-      - if: steps.tag.outputs.tag != ''
-        id: ecr
+      - id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - if: steps.tag.outputs.tag != ''
-        name: Create the ECR repository if it does not exist
+      - name: Create the ECR repository if it does not exist
         run: |
           aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" > /dev/null 2>&1 \
             || aws ecr create-repository --repository-name "$ECR_REPOSITORY" \
                  --image-scanning-configuration scanOnPush=false
 
-      - if: steps.tag.outputs.tag != ''
-        id: exists
+      - id: exists
         name: Look for an image with this tag
         run: |
           if aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="${{ steps.tag.outputs.tag }}" > /dev/null 2>&1; then
@@ -113,12 +96,6 @@ jobs:
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
           fi
-
-      - if: steps.exists.outputs.found == 'false'
-        name: Download the model into the build context
-        run: |
-          aws s3 sync "s3://${{ steps.tag.outputs.bucket }}/models/" container/model/ --only-show-errors
-          test -f container/model/adapter/head.pt && test -f container/model/base/config.json
 
       - if: steps.exists.outputs.found == 'false'
         uses: docker/setup-buildx-action@v4
@@ -137,8 +114,7 @@ jobs:
           cache-to: type=gha,mode=max
 
   deploy-app:
-    needs: build-and-push
-    if: needs.build-and-push.outputs.tag != ''
+    needs: [deploy-model, build-and-push]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -163,6 +139,28 @@ jobs:
         run: |
           pnpm dlx aws-cdk@${CDK_VERSION} deploy KevSystemOneStack --require-approval never --outputs-file cdk-outputs.json \
             -c imageTag="${{ needs.build-and-push.outputs.tag }}" -c ecrRepository="$ECR_REPOSITORY"
+
+      # Invokes the function with an API Gateway event. The first call is a cold start (model download and load).
+      - name: Smoke test
+        run: |
+          BUCKET=$(aws cloudformation describe-stacks --stack-name KevModelStack \
+            --query "Stacks[0].Outputs[?OutputKey=='ModelBucketName'].OutputValue" --output text)
+          COUNT=$(aws s3 ls "s3://$BUCKET/models/" --recursive | wc -l || true)
+          if [ "${COUNT// /}" = "0" ]; then
+            echo "::warning::No model files in s3://$BUCKET/models/; run the 'ingest' workflow. Skipping the smoke test."
+            exit 0
+          fi
+          FN=$(jq -r '.KevSystemOneStack.InferenceFunctionName' cdk-outputs.json)
+          BODY=$(jq -nc '{state: "I was charged twice for order 1182.", questions: {urgent: {type: "noul", instructions: "Does this need a reply today?"}}}')
+          jq -n --arg body "$BODY" '{resource: "/v1/systemone", path: "/v1/systemone", httpMethod: "POST",
+            headers: {"content-type": "application/json"}, multiValueHeaders: {"content-type": ["application/json"]},
+            isBase64Encoded: false, body: $body,
+            requestContext: {resourcePath: "/v1/systemone", httpMethod: "POST", path: "/demo/v1/systemone", stage: "demo", identity: {sourceIp: "127.0.0.1"}}}' > event.json
+          aws lambda invoke --function-name "$FN" --payload fileb://event.json --cli-binary-format raw-in-base64-out \
+            --cli-read-timeout 300 out.json > invoke.json
+          cat invoke.json
+          jq -e '(.FunctionError | not) and .StatusCode == 200' invoke.json > /dev/null
+          jq -e '.statusCode == 200 and (.body | fromjson | .answers.urgent.type == "noul")' out.json
 
       - name: Summary
         run: |

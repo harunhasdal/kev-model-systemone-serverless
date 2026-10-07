@@ -58,6 +58,8 @@ class ModelStack(Stack):
             timeout=Duration.hours(1),
         )
 
+        self.bucket = bucket
+
         CfnOutput(self, "ModelBucketName", value=bucket.bucket_name)
         CfnOutput(self, "IngestStateMachineArn", value=ingest.state_machine_arn)
 
@@ -66,9 +68,10 @@ class ModelStack(Stack):
 
 
 class SystemOneStack(Stack):
-    """CPU inference (Lambda container with the model baked in) and the REST API in front of it."""
+    """CPU inference (Lambda container that loads the model from S3 at start-up) and the REST API in front of it."""
 
-    def __init__(self, scope: Construct, construct_id: str, *, repository_name: str, image_tag: str, **kwargs) -> None:
+    def __init__(self, scope: Construct, construct_id: str, *, repository_name: str, image_tag: str,
+                 model_bucket: s3.IBucket, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         repository = ecr.Repository.from_repository_name(self, "Repository", repository_name)
@@ -77,11 +80,12 @@ class SystemOneStack(Stack):
             code=_lambda.DockerImageCode.from_ecr(repository, tag_or_digest=image_tag),
             architecture=_lambda.Architecture.X86_64,
             memory_size=10240,   # also sets the vCPU share: 6 vCPUs at 10 GB
-            ephemeral_storage_size=Size.mebibytes(4096),   # the model is staged from the image to /tmp at start-up
+            ephemeral_storage_size=Size.mebibytes(4096),   # the model is downloaded to /tmp at start-up
             timeout=Duration.minutes(2),
             log_group=logs.LogGroup(self, "InferenceLogs", retention=logs.RetentionDays.ONE_WEEK, removal_policy=RemovalPolicy.DESTROY),
-            environment={"MAX_STATE_TOKENS": str(MAX_STATE_TOKENS)},
+            environment={"MODEL_BUCKET": model_bucket.bucket_name, "MAX_STATE_TOKENS": str(MAX_STATE_TOKENS)},
         )
+        model_bucket.grant_read(inference)
 
         api = apigw.RestApi(
             self, "Api",
@@ -104,5 +108,6 @@ class SystemOneStack(Stack):
         plan.add_api_key(api_key)
         plan.add_api_stage(stage=api.deployment_stage)
 
+        CfnOutput(self, "InferenceFunctionName", value=inference.function_name)
         CfnOutput(self, "ApiUrl", value=api.url)
         CfnOutput(self, "ApiKeyId", value=api_key.key_id)

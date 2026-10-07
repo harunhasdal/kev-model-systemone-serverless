@@ -1,6 +1,7 @@
 name: ingest
 
-# On demand: copy the Kev adapter and its base model from Hugging Face to S3, then rebuild the image from them.
+# On demand: copy the Kev adapter and its base model from Hugging Face to S3. The Lambda downloads them at cold start,
+# so running environments keep the previous model until they are recycled.
 on:
   workflow_dispatch:
     inputs:
@@ -16,15 +17,10 @@ on:
       baseRevision:
         description: Base model revision (empty = main)
         required: false
-      rebuild:
-        description: Run the ci workflow afterwards to rebuild and deploy the image
-        type: boolean
-        default: true
 
 permissions:
   id-token: write
   contents: read
-  actions: write
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
@@ -57,9 +53,3 @@ jobs:
           done
           echo "ingest execution: $STATUS"
           [ "$STATUS" = SUCCEEDED ]
-
-      - name: Rebuild and deploy
-        if: inputs.rebuild
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"

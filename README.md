@@ -2,7 +2,7 @@
 
 Serves [Kev-0.8B](https://github.com/jaredpalmer/kev/blob/main/docs/model-cards/kev-0.8b.md) (a decision model with
 Choice, Score and Noul questions, TypeSafe `POST /v1/systemone` API) from a CPU Lambda container behind API Gateway,
-with the model weights baked into the image.
+with the model loaded from S3 at cold start.
 
 Kev scores options in one forward pass and does not generate text, so the API does not stream and the model is not a
 Bedrock Custom Model Import candidate (Qwen3.5 architecture, adapter-only repo, no LM head).
@@ -23,7 +23,7 @@ flowchart LR
     end
 
     HF[Hugging Face: adapter and base model]
-    ECR[(ECR image: code + weights)]
+    ECR[(ECR image: code only)]
 
     subgraph AppStack[KevSystemOneStack]
         APIGW[API Gateway REST, API key and usage plan]
@@ -35,16 +35,17 @@ flowchart LR
 
     ING -->|start execution| SFN
     HF -->|streamed, multipart| SFN
-    ING -.->|then dispatches| CI
     CI -->|cdk deploy| ModelStack
-    CI -->|s3 sync into build context| S3
     CI -->|docker build and push| ECR
     CI -->|cdk deploy, imageTag| AppStack
+    CI -->|smoke test invoke| FN
     ECR -->|image| FN
+    S3 -->|download to /tmp at cold start| FN
 ```
 
-Request path: client, API Gateway (API key), Lambda container. Build path: Hugging Face to S3 (on demand), S3 into the
-Docker build context, image in ECR, Lambda. The Lambda has no S3 access and does not reach the internet at run time.
+Request path: client, API Gateway (API key), Lambda container. Model path: Hugging Face to S3 (on demand), then S3 to
+the Lambda's `/tmp` at each cold start. The Lambda needs read access to the bucket and no internet access at run time.
+Baking the weights into the image was tried and was far slower on Lambda (see Limits).
 
 ## Layout
 
@@ -52,9 +53,9 @@ Docker build context, image in ECR, Lambda. The Lambda has no S3 access and does
 |---|---|
 | `kev_systemone/stacks.py` | CDK: `ModelStack` (bucket, ingest state machine), `SystemOneStack` (Lambda, API) |
 | `lambdas/ingest/` | Hugging Face to S3 copy functions |
-| `container/` | Inference image: CPU torch, `kev` pinned to a commit, `server.py` entry point, baked `model/` |
-| `.github/workflows/ci.yml` | Tests, deploys the model stack, builds and pushes the image, deploys the app stack |
-| `.github/workflows/ingest.yml` | On demand: copies the model from Hugging Face to S3, then triggers `ci` |
+| `container/` | Inference image: CPU torch, `kev` pinned to a commit, `server.py` entry point |
+| `.github/workflows/ci.yml` | Tests, deploys the model stack, builds and pushes the image, deploys the app stack, smoke test |
+| `.github/workflows/ingest.yml` | On demand: copies the model from Hugging Face to S3 |
 | `samples/choice_noul.py` | Choice, Noul and Score demo against the API |
 
 ## CI/CD
@@ -64,24 +65,26 @@ Everything runs in GitHub Actions; there are no local CDK commands.
 `ci.yml` runs on push to `main` or manual dispatch:
 
 1. `test`: `uv run pytest`.
-2. `deploy-model`: bootstraps CDK if `CDKToolkit` is absent, deploys `KevModelStack`.
-3. `build-and-push`: creates the ECR repository if missing, downloads `s3://<bucket>/models/` into `container/model/`
-   and builds the image. The tag is `<git tree hash of container/>-<fingerprint of the S3 model files>`; if an image
-   with that tag exists the build is skipped. If the bucket is empty the job warns and the rest is skipped.
-4. `deploy-app`: deploys `KevSystemOneStack` with `-c imageTag=<tag>`. The job summary shows the API URL and API key id.
+2. `deploy-model`: bootstraps CDK if `CDKToolkit` is absent, deploys `KevModelStack` (bucket, ingest state machine).
+3. `build-and-push` (parallel with 2): creates the ECR repository if missing, builds `container/` and pushes it tagged
+   with the git tree hash of `container/`; if an image with that tag exists the build is skipped. Docker layers are
+   cached in the GitHub Actions cache.
+4. `deploy-app`: deploys `KevSystemOneStack` with `-c imageTag=<tag>`, then invokes the function once with an API Gateway
+   event (a cold start, up to a few minutes) and fails the job unless it returns 200 with a Noul answer. The smoke test is
+   skipped with a warning if the model bucket is empty. The job summary shows the API URL and API key id.
 
-`ingest.yml` is run by hand when the model should change (and once at the start). It runs the state machine (files
-already in S3 with the right size are skipped, stale keys are pruned), waits for it, then dispatches `ci` unless
-`rebuild` is unticked. Inputs override the adapter and base repos and revisions; revisions default to `main` and are
-resolved to commit shas.
+`ingest.yml` is run by hand, once at the start and whenever the model should change. It runs the state machine (files
+already in S3 with the right size are skipped, stale keys are pruned) and waits for it. Inputs override the adapter and
+base repos and revisions; revisions default to `main` and are resolved to commit shas. Running Lambda environments keep
+the previous model until they are recycled.
 
-First run: push (or run `ci`), which deploys the model stack and stops at the empty bucket with a warning. Run
-`ingest`; it triggers `ci` again, which builds the image and deploys the API.
+First run: push (or run `ci`), which deploys everything but warns that the bucket is empty and skips the smoke test; the
+API fails until the model is there. Run `ingest`, then `ci` again to check the deployment end to end.
 
 Repository variables: `AWS_ROLE_ARN` (assumed through OIDC), and optionally `AWS_REGION` (default `us-east-1`) and
 `ECR_REPOSITORY` (default `kev-model-systemone-serverless`). The role needs ECR push and create-repository, CDK
-bootstrap and deploy (CloudFormation, IAM, Lambda, API Gateway, S3, Step Functions, logs), `s3:ListBucket` and
-`s3:GetObject` on the model bucket, `cloudformation:DescribeStacks`, and `states:StartExecution` and
+bootstrap and deploy (CloudFormation, IAM, Lambda, API Gateway, S3, Step Functions, logs), `s3:ListBucket` on the model
+bucket, `cloudformation:DescribeStacks`, `lambda:InvokeFunction` (smoke test), and `states:StartExecution` and
 `states:DescribeExecution`.
 
 CDK context values (`-c`): `ecrRepository`, `imageTag` (default `latest`), `adapterRepo` (`jaredpalmer/kev-0.8b`),
@@ -98,27 +101,24 @@ KEV_API_URL=<ApiUrl without trailing slash> KEV_API_KEY=<key> uv run python samp
 
 - State is capped at 8,192 tokens (`MAX_STATE_TOKENS`), the length the model card validates. Longer states return 422.
   The CPU path uses eager attention with an L x L mask, so longer states would not fit in 10 GB.
-- Cold start: with the weights downloaded from S3 at start-up, the first invocation took about 160 s and warm calls
-  about 0.5 s of model time. With the weights in the image the cold start has not been measured yet. API Gateway
-  cuts off at 29 s, so the first request after idle may return 504; retry. Provisioned concurrency avoids it at a
-  standing cost.
+- Cold start: the Lambda downloads about 1.8 GB from S3 to `/tmp` and loads the model. In an earlier measurement the
+  download took about 24 s and the first request about 40 s in total, on top of a 10 s init. API Gateway cuts off at
+  29 s, so the first request after idle may return 504; retry. Provisioned concurrency avoids it at a standing cost.
+- Baking the weights into the image was tried and abandoned: on Lambda, fresh environments did not finish loading
+  within the 120 s function timeout (the staging copy from the image to `/tmp` never completed), against about 24 s for
+  the S3 download. The cause is not proven; Lambda loads image contents lazily, which fits the symptom.
 - The API key and usage plan (5 req/s, 1,000 req/day) are the only access control.
 - The base image (`python:3.12-slim`) is not pinned by digest; it refreshes only when `container/` changes.
 
 ## Local test
 
-Put the model under `container/model/{adapter,base}` (the files the ingest copies: `*.json`, `*.safetensors`,
-`*.pt`, `*.txt`, `*.jinja`), then:
+Put the model under `.models/{adapter,base}` (the files the ingest copies: `*.json`, `*.safetensors`, `*.pt`,
+`*.txt`, `*.jinja`), then:
 
 ```
 docker build -t kev-systemone container
-docker run -p 8080:8080 kev-systemone
+docker run -p 8080:8080 -e MODEL_DIR=/models -v "$PWD/.models:/models" kev-systemone
 python samples/choice_noul.py
-```
-
-Or skip the copy into the image and mount a directory: `-e MODEL_DIR=/models -v "$PWD/.models:/models"`.
-
-```
 uv run pytest
 ```
 
@@ -165,5 +165,5 @@ request to S3, calls `InvokeEndpointAsync`, and either polls the output location
 poll. For a synchronous experience, use a real-time endpoint and call `InvokeEndpoint` from the Lambda.
 
 **CI/CD**: reuse the pattern here. Build the image in GitHub Actions and push it to ECR, tagged by content, and deploy
-the SageMaker model, endpoint config and endpoint (and the scaling policy) with CDK. Do not bake the weights into a
-GPU image unless the endpoint start time matters more than image size; the S3 model data source keeps the image small.
+the SageMaker model, endpoint config and endpoint (and the scaling policy) with CDK. Keep the weights out of the image
+(baking them into the Lambda image was much slower here); the S3 model data source keeps the image small.

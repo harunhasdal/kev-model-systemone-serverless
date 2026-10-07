@@ -9,7 +9,9 @@ ENV = cdk.Environment(account="123456789012", region="us-east-1")
 
 
 def system_one_template() -> Template:
-    stack = SystemOneStack(cdk.App(), "Test", repository_name="repo", image_tag="abc123", env=ENV)
+    app = cdk.App()
+    model = ModelStack(app, "Model", adapter_repo="org/adapter", base_repo="org/base", env=ENV)
+    stack = SystemOneStack(app, "Test", repository_name="repo", image_tag="abc123", model_bucket=model.bucket, env=ENV)
     return Template.from_stack(stack)
 
 
@@ -28,11 +30,12 @@ def test_inference_function_is_a_cpu_container():
     })
 
 
-def test_inference_function_has_no_bucket_dependency():
-    # The weights are baked into the image; the Lambda needs no S3 access.
+def test_inference_function_reads_the_model_bucket():
     template = system_one_template()
-    template.resource_count_is("AWS::S3::Bucket", 0)
-    assert "s3:GetObject" not in json.dumps(template.to_json())
+    template.has_resource_properties("AWS::Lambda::Function", {
+        "Environment": {"Variables": Match.object_like({"MODEL_BUCKET": Match.any_value()})},
+    })
+    assert "s3:GetObject*" in json.dumps(template.to_json())
 
 
 def test_api_requires_a_key():
