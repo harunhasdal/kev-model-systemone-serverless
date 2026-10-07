@@ -95,10 +95,103 @@ CDK context values (`-c`): `ecrRepository`, `imageTag` (default `latest`), `adap
 
 ## Use
 
+The commands below need AWS credentials for the account the stacks are deployed in, plus `curl` and optionally `jq`.
+
+**Get the endpoint and API key** (nothing secret is stored in this repository):
+
 ```
-aws apigateway get-api-key --api-key <ApiKeyId> --include-value --query value --output text
-KEV_API_URL=<ApiUrl without trailing slash> KEV_API_KEY=<key> uv run python samples/choice_noul.py
+export AWS_REGION=us-east-1   # the region you deployed to
+
+output() {
+  aws cloudformation describe-stacks --stack-name KevSystemOneStack --region "$AWS_REGION" \
+    --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
+}
+
+export KEV_API_URL=$(output ApiUrl); KEV_API_URL=${KEV_API_URL%/}
+export KEV_API_KEY=$(aws apigateway get-api-key --api-key "$(output ApiKeyId)" --region "$AWS_REGION" \
+  --include-value --query value --output text)
 ```
+
+The first request after the Lambda has been idle is a cold start (about 40 s measured, up to 90 s), so give `curl` time
+with `--max-time 150`. Later requests take about a second. Add `| jq` to pretty-print the responses.
+
+**Run the sample script** (three tickets, each with a Choice, Noul and Score question):
+
+```
+uv run python samples/choice_noul.py
+```
+
+**List the loaded model:**
+
+```
+curl -s --max-time 150 -H "x-api-key: $KEV_API_KEY" "$KEV_API_URL/v1/models"
+```
+
+**Choice and Noul:** route a ticket to a team and judge urgency.
+
+```
+curl -s --max-time 150 -X POST "$KEV_API_URL/v1/systemone" \
+  -H "x-api-key: $KEV_API_KEY" -H "content-type: application/json" \
+  -d '{
+    "state": "I was charged twice for order 1182. Please refund one of the charges.",
+    "questions": {
+      "team": {
+        "type": "choice",
+        "instructions": "Which team should handle this?",
+        "criteria": {"billing": "Charges and refunds", "shipping": "Deliveries", "returns": "Exchanges"}
+      },
+      "urgent": {"type": "noul", "instructions": "Does this need a reply today?"}
+    }
+  }'
+```
+
+The response has `answers.team.choice` with its `confidence` and `probabilities` per option, and `answers.urgent.noul`,
+the probability of "yes".
+
+**Score:** rate an ordered scale (the answer is an expected level, 0 is the first level).
+
+```
+curl -s --max-time 150 -X POST "$KEV_API_URL/v1/systemone" \
+  -H "x-api-key: $KEV_API_KEY" -H "content-type: application/json" \
+  -d '{
+    "state": "My parcel has been stuck at the depot for a week and nobody answers. This is the third time I am writing.",
+    "questions": {
+      "frustration": {
+        "type": "score",
+        "instructions": "How frustrated is the customer?",
+        "criteria": ["calm", "mildly annoyed", "angry"]
+      }
+    }
+  }'
+```
+
+**Structured state:** the state can be a JSON object; field names are kept as labels.
+
+```
+curl -s --max-time 150 -X POST "$KEV_API_URL/v1/systemone" \
+  -H "x-api-key: $KEV_API_KEY" -H "content-type: application/json" \
+  -d '{
+    "state": {"order": 1182, "customer_message": "The jacket is a size too small.", "days_since_delivery": 3},
+    "questions": {
+      "action": {
+        "type": "choice",
+        "instructions": "What should support do?",
+        "criteria": {"exchange": "Swap for another size", "refund": "Refund the order", "none": "No action needed"}
+      },
+      "within_policy": {"type": "noul", "instructions": "Is this within a 30 day return window?"}
+    }
+  }'
+```
+
+**Check the length limit:** a state over 8,192 tokens returns HTTP 422 with the token count.
+
+```
+curl -s -o /dev/null -w '%{http_code}\n' --max-time 150 -X POST "$KEV_API_URL/v1/systemone" \
+  -H "x-api-key: $KEV_API_KEY" -H "content-type: application/json" \
+  -d "{\"state\": \"$(printf 'word %.0s' $(seq 1 9000))\", \"questions\": {\"u\": {\"type\": \"noul\"}}}"
+```
+
+A request without the key returns 403.
 
 ## Limits
 
