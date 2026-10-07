@@ -157,11 +157,16 @@ jobs:
             --include-value --query value --output text)
           echo "::add-mask::$KEY"
           BODY='{"state": "I was charged twice for order 1182.", "questions": {"urgent": {"type": "noul", "instructions": "Does this need a reply today?"}}}'
-          for attempt in 1 2; do
-            CODE=$(curl -sS -o out.json -w '%{http_code}' --max-time 240 -X POST "$URL" \
+          # A fresh stage, alias and permission can return 500 for a short while after the deploy.
+          for attempt in 1 2 3; do
+            CODE=$(curl -sS -D headers.txt -o out.json -w '%{http_code}' --max-time 240 -X POST "$URL" \
               -H "x-api-key: $KEY" -H "content-type: application/json" -d "$BODY" || true)
             echo "attempt $attempt: HTTP $CODE"
             [ "$CODE" = 200 ] && break
+            cat headers.txt || true; head -c 500 out.json || true; echo
+            sleep 20
+          done
+          [ "$CODE" = 200 ] && break
             head -c 500 out.json || true; echo
           done
           [ "$CODE" = 200 ]
