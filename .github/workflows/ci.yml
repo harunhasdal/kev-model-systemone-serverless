@@ -166,9 +166,6 @@ jobs:
             cat headers.txt || true; head -c 500 out.json || true; echo
             sleep 20
           done
-          [ "$CODE" = 200 ] && break
-            head -c 500 out.json || true; echo
-          done
           [ "$CODE" = 200 ]
           jq -e '.answers.urgent.type == "noul"' out.json
 
