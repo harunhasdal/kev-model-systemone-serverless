@@ -101,9 +101,10 @@ KEV_API_URL=<ApiUrl without trailing slash> KEV_API_KEY=<key> uv run python samp
 
 - State is capped at 8,192 tokens (`MAX_STATE_TOKENS`), the length the model card validates. Longer states return 422.
   The CPU path uses eager attention with an L x L mask, so longer states would not fit in 10 GB.
-- Cold start: the Lambda downloads about 1.8 GB from S3 to `/tmp` and loads the model. In an earlier measurement the
-  download took about 24 s and the first request about 40 s in total, on top of a 10 s init. API Gateway cuts off at
-  29 s, so the first request after idle may return 504; retry. Provisioned concurrency avoids it at a standing cost.
+- Cold start, measured on Lambda (10 GB, 6 vCPUs): 10 s init, 24 s S3 download of about 1.8 GB to `/tmp`, 45 s to load
+  and merge the model on CPU, then the first request: about 83 s billed in total. API Gateway cuts off at 29 s, so the
+  first request after idle returns 504; retry after a minute or two. Provisioned concurrency avoids it at a standing
+  cost. Warm requests take about 0.5 s of model time for two questions.
 - Baking the weights into the image was tried and abandoned: on Lambda, fresh environments did not finish loading
   within the 120 s function timeout (the staging copy from the image to `/tmp` never completed), against about 24 s for
   the S3 download. The cause is not proven; Lambda loads image contents lazily, which fits the symptom.
