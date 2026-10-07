@@ -32,6 +32,7 @@ COPY server.py .
 
 # CI downloads the model from S3 into model/{adapter,base} before building. Last, so code changes keep this layer cached.
 COPY model/ /opt/model/
+RUN test -f /opt/model/adapter/head.pt && test -f /opt/model/base/config.json
 ENV MODEL_DIR=/opt/model
 
 CMD ["python", "server.py"]
